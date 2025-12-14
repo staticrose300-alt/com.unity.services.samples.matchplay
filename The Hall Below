@@ -1,0 +1,1040 @@
+Assets/
+  Scripts/
+    Core/
+      AppBootstrap.cs
+      GameConfig.cs
+      GameFlow.cs
+      RoleAssigner.cs
+      VoiceChatController.cs
+    Network/
+      NetRunner.cs
+      NetPlayer.cs
+      NetRoomManager.cs
+      NetSharedLighting.cs
+      NetMonster.cs
+    Systems/
+      LightingSystem.cs
+      FlashbackSystem.cs
+      MasterySystem.cs
+      CoinSpawner.cs
+      InventorySystem.cs
+      UserNameSystem.cs
+      CloudSaveManager.cs
+      CutsceneController.cs
+      EnvironmentalStoryManager.cs
+    AI/
+      MonsterAI.cs
+      MonsterSenses.cs
+      MonsterStateController.cs
+    UI/
+      MainMenuController.cs
+      LobbyUI.cs
+      ShopUI.cs
+      InventoryUI.cs
+      HUDController.cs
+      PingWheelController.cs
+    Map/
+      HallwayGraph.cs
+      SpawnPoints.cs
+  Prefabs/
+    Player.prefab
+    Monster.prefab
+    Coin.prefab
+    Flashlight.prefab
+    LightNode.prefab
+    LobbyUI.prefab
+    MainMenu.prefab
+  Scenes/
+    Boot.unity
+    MainMenu.unity
+    Lobby.unity
+    HallsBelow_Map.unity
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+public class AppBootstrap : MonoBehaviour
+{
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterAssembliesLoaded)]
+    static void OnBoot()
+    {
+        Application.targetFrameRate = 60;
+        QualitySettings.vSyncCount = 0;
+        SceneManager.LoadScene("Boot");
+    }
+}
+using UnityEngine;
+
+[CreateAssetMenu(fileName = "GameConfig", menuName = "Config/GameConfig")]
+public class GameConfig : ScriptableObject
+{
+    [Header("Match")]
+    public int minPlayers = 5;
+    public int maxPlayers = 6;
+    public float sessionMinutes = 12f;
+
+    [Header("Lighting")]
+    public float baseFlickerMin = 0.1f;
+    public float baseFlickerMax = 0.6f;
+
+    [Header("Coins")]
+    public int coinsMin = 30;
+    public int coinsMax = 50;
+    public float riskyWeight = 1.75f;
+
+    [Header("Flashbacks")]
+    public float proximityTriggerDist = 8f;
+    public float standStillSeconds = 7f;
+
+    [Header("Mastery")]
+    public int masteryMaxLevel = 4;
+
+    [Header("Roles")]
+    public bool enableMedic = true;
+    public bool enableDetective = true;
+    public bool enableWatcher = true;
+
+    [Header("Audio")]
+    public float proximityVoiceFalloff = 12f;
+}
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+public enum MatchPhase { None, Lobby, Cutscene, Playing, Ending }
+
+public class GameFlow : MonoBehaviour
+{
+    public static GameFlow I;
+    public MatchPhase Phase { get; private set; } = MatchPhase.None;
+    public GameConfig config;
+
+    void Awake()
+    {
+        I = this;
+        DontDestroyOnLoad(gameObject);
+    }
+
+    public void GoToMainMenu() => SceneManager.LoadScene("MainMenu");
+    public void GoToLobby()
+    {
+        Phase = MatchPhase.Lobby;
+        SceneManager.LoadScene("Lobby");
+    }
+
+    public void StartCutscene()
+    {
+        Phase = MatchPhase.Cutscene;
+        SceneManager.LoadScene("HallsBelow_Map");
+        // CutsceneController will signal transition to Playing
+    }
+
+    public void BeginMatch()
+    {
+        Phase = MatchPhase.Playing;
+        // Initialize systems post-cutscene
+        LightingSystem.I?.Initialize();
+        MasterySystem.I?.InitializeSession();
+        CoinSpawner.I?.SpawnSessionCoins();
+        EnvironmentalStoryManager.I?.Init();
+    }
+
+    public void EndMatch(bool escaped, bool truth, bool masteryEnding)
+    {
+        Phase = MatchPhase.Ending;
+        // Save progression
+        MasterySystem.I?.CommitSessionProgress(escaped, truth, masteryEnding);
+        CloudSaveManager.I?.Flush();
+        // Return to lobby or main menu
+        GoToMainMenu();
+    }
+}
+using UnityEngine;
+using System;
+using System.Collections.Generic;
+
+public class NetRunner : MonoBehaviour
+{
+    public static NetRunner I;
+    public event Action<int> OnPlayerCountChanged;
+    public List<NetPlayer> ConnectedPlayers = new();
+
+    void Awake() { I = this; DontDestroyOnLoad(gameObject); }
+
+    public void CreateOrJoinRoom(string roomName = "HallsBelow")
+    {
+        // TODO: Join/Create room via networking SDK
+    }
+
+    public void NotifyPlayerJoined(NetPlayer p)
+    {
+        ConnectedPlayers.Add(p);
+        OnPlayerCountChanged?.Invoke(ConnectedPlayers.Count);
+    }
+
+    public void NotifyPlayerLeft(NetPlayer p)
+    {
+        ConnectedPlayers.Remove(p);
+        OnPlayerCountChanged?.Invoke(ConnectedPlayers.Count);
+    }
+
+    public bool CanStartMatch(int minPlayers, int maxPlayers)
+    {
+        return ConnectedPlayers.Count >= minPlayers && ConnectedPlayers.Count <= maxPlayers;
+    }
+
+    public void BroadcastLightingEvent(int lightNodeId, float flickerIntensity, float duration)
+    {
+        // TODO: RPC to all clients with synced timing
+    }
+
+    public void BroadcastMonsterEvent(string state, Vector3 position)
+    {
+        // TODO: RPC to all clients for monster state sync
+    }
+
+    public void BroadcastFlashback(string flashId)
+    {
+        // Shared flashbacks: trigger on all players simultaneously
+        // TODO: RPC trigger
+    }
+}
+using UnityEngine;
+
+public class NetRoomManager : MonoBehaviour
+{
+    public GameConfig config;
+
+    void OnEnable()
+    {
+        NetRunner.I.OnPlayerCountChanged += CountChanged;
+    }
+    void OnDisable()
+    {
+        NetRunner.I.OnPlayerCountChanged -= CountChanged;
+    }
+
+    void CountChanged(int count)
+    {
+        LobbyUI.I?.UpdatePlayerCount(count, config.minPlayers, config.maxPlayers);
+        if (NetRunner.I.CanStartMatch(config.minPlayers, config.maxPlayers))
+        {
+            RoleAssigner.AssignRoles(NetRunner.I.ConnectedPlayers);
+            GameFlow.I.StartCutscene();
+        }
+    }
+}
+using UnityEngine;
+
+public class NetRoomManager : MonoBehaviour
+{
+    public GameConfig config;
+
+    void OnEnable()
+    {
+        NetRunner.I.OnPlayerCountChanged += CountChanged;
+    }
+    void OnDisable()
+    {
+        NetRunner.I.OnPlayerCountChanged -= CountChanged;
+    }
+
+    void CountChanged(int count)
+    {
+        LobbyUI.I?.UpdatePlayerCount(count, config.minPlayers, config.maxPlayers);
+        if (NetRunner.I.CanStartMatch(config.minPlayers, config.maxPlayers))
+        {
+            RoleAssigner.AssignRoles(NetRunner.I.ConnectedPlayers);
+            GameFlow.I.StartCutscene();
+        }
+    }
+}
+using UnityEngine;
+
+public class NetSharedLighting : MonoBehaviour
+{
+    public static NetSharedLighting I;
+    void Awake() { I = this; }
+
+    public void SyncFlicker(int nodeId, float intensity, float seconds)
+    {
+        NetRunner.I.BroadcastLightingEvent(nodeId, intensity, seconds);
+    }
+}
+using UnityEngine;
+
+public class NetMonster : MonoBehaviour
+{
+    public static NetMonster I;
+
+    void Awake() { I = this; }
+
+    public void SyncState(MonsterState state, Vector3 pos)
+    {
+        NetRunner.I.BroadcastMonsterEvent(state.ToString(), pos);
+    }
+}
+using UnityEngine;
+
+public class VoiceChatController : MonoBehaviour
+{
+    public static VoiceChatController I;
+    public float proximityFalloff = 12f; // from GameConfig
+
+    void Awake() { I = this; }
+
+    public void UpdateVoiceForPlayer(Transform listener, Transform speaker)
+    {
+        float d = Vector3.Distance(listener.position, speaker.position);
+        float volume = Mathf.Clamp01(1f - (d / proximityFalloff));
+        // TODO: apply volume to voice stream
+        // TODO: distort or cut when monster near (via MonsterSenses proximity)
+    }
+
+    public void OnMonsterNear(float severity)
+    {
+        // Add static/interference to all streams based on severity
+    }
+}
+using UnityEngine;
+using System.Collections.Generic;
+
+public class LightingSystem : MonoBehaviour
+{
+    public static LightingSystem I;
+    [SerializeField] List<LightNode> nodes = new();
+    public GameConfig config;
+
+    void Awake() { I = this; }
+
+    public void Initialize()
+    {
+        foreach (var n in nodes) n.ResetToStable();
+    }
+
+    public void FlickerNearMonster(Vector3 monsterPos, float radius, float intensity, float seconds)
+    {
+        foreach (var n in nodes)
+        {
+            float d = Vector3.Distance(monsterPos, n.transform.position);
+            if (d <= radius)
+            {
+                n.Flicker(intensity, seconds);
+                NetSharedLighting.I.SyncFlicker(n.NodeId, intensity, seconds);
+            }
+        }
+    }
+}
+using UnityEngine;
+
+public class LightNode : MonoBehaviour
+{
+    public int NodeId;
+    public Light lightComp;
+    bool isStable = true;
+
+    public void ResetToStable()
+    {
+        isStable = true;
+        if (lightComp != null) { lightComp.enabled = true; lightComp.intensity = 1f; }
+    }
+
+    public void Flicker(float intensity, float seconds)
+    {
+        isStable = false;
+        StartCoroutine(FlickerRoutine(intensity, seconds));
+    }
+
+    System.Collections.IEnumerator FlickerRoutine(float intensity, float seconds)
+    {
+        float t = 0f;
+        while (t < seconds)
+        {
+            lightComp.enabled = !lightComp.enabled;
+            lightComp.intensity = Random.Range(0.2f, intensity);
+            yield return new WaitForSeconds(Random.Range(0.05f, 0.3f));
+            t += Time.deltaTime;
+        }
+        ResetToStable();
+    }
+
+    public void Shutdown(float seconds)
+    {
+        lightComp.enabled = false;
+        Invoke(nameof(ResetToStable), seconds);
+    }
+}
+using UnityEngine;
+
+public enum MonsterState { Dormant, Stalking, Hunting, Vanish }
+
+public class MonsterAI : MonoBehaviour
+{
+    public static MonsterAI I;
+    public MonsterState State { get; private set; } = MonsterState.Dormant;
+    public float hearingRadius = 18f;
+    public float huntingDarkRadius = 12f;
+    public float speed = 3.2f;
+
+    Transform target;
+    float masteryAggressionScale => 0.8f + MasterySystem.I.Level * 0.3f;
+
+    void Awake() { I = this; }
+
+    void Update()
+    {
+        SensePlayers();
+        Act();
+    }
+
+    void SensePlayers()
+    {
+        // Pseudocode: pick loudest or nearest player
+        var p = MonsterSenses.FindMostDetectablePlayer(transform.position, hearingRadius, masteryAggressionScale);
+        if (p != null) target = p.transform;
+    }
+
+    void Act()
+    {
+        switch (State)
+        {
+            case MonsterState.Dormant:
+                if (target) TransitionTo(MonsterState.Stalking);
+                break;
+            case MonsterState.Stalking:
+                LightingSystem.I.FlickerNearMonster(transform.position, huntingDarkRadius, 1.2f, Random.Range(1.2f, 2.0f));
+                MoveTowardsTarget(0.6f * speed);
+                if (CanStrike()) TransitionTo(MonsterState.Hunting);
+                break;
+            case MonsterState.Hunting:
+                LightingSystem.I.FlickerNearMonster(transform.position, huntingDarkRadius, 1.5f, Random.Range(1.4f, 2.4f));
+                MoveTowardsTarget(speed * masteryAggressionScale);
+                if (!target) TransitionTo(MonsterState.Vanish);
+                break;
+            case MonsterState.Vanish:
+                // Relocate, false signals at high mastery
+                if (MasterySystem.I.Level >= 3 && Random.value < 0.4f) EnvironmentalStoryManager.I.EmitFalseSignal();
+                TeleportToShadow();
+                TransitionTo(MonsterState.Dormant);
+                break;
+        }
+    }
+
+    void TransitionTo(MonsterState s)
+    {
+        State = s;
+        NetMonster.I.SyncState(s, transform.position);
+    }
+
+    void MoveTowardsTarget(float s)
+    {
+        if (!target) return;
+        Vector3 dir = (target.position - transform.position).normalized;
+        transform.position += dir * s * Time.deltaTime;
+    }
+
+    bool CanStrike()
+    {
+        return target && Vector3.Distance(transform.position, target.position) < 2.2f;
+    }
+
+    void TeleportToShadow()
+    {
+        // Choose a far dark hallway node
+        transform.position = HallwayGraph.I.GetRandomShadowCorner();
+    }
+}
+using UnityEngine;
+using System.Linq;
+
+public static class MonsterSenses
+{
+    public static NetPlayer FindMostDetectablePlayer(Vector3 monsterPos, float baseRadius, float aggressionScale)
+    {
+        var players = NetRunner.I.ConnectedPlayers;
+        float bestScore = 0f;
+        NetPlayer best = null;
+
+        foreach (var p in players)
+        {
+            float d = Vector3.Distance(monsterPos, p.transform.position);
+            if (d > baseRadius) continue;
+
+            // Detection influenced by voice loudness and movement noise, scaled by mastery
+            float voice = p.CurrentVoiceLevel; // 0..1
+            float moveNoise = p.IsRunning ? 0.7f : 0.25f;
+            float score = (1f / Mathf.Max(d, 0.1f)) + (voice * 1.5f) + moveNoise;
+            score *= aggressionScale;
+
+            if (score > bestScore) { bestScore = score; best = p; }
+        }
+        return best;
+    }
+}
+using UnityEngine;
+using System.Collections.Generic;
+
+public enum FlashbackType { VisualGlitch, AudioMemory, RareText }
+
+public class FlashbackSystem : MonoBehaviour
+{
+    public static FlashbackSystem I;
+    public GameConfig config;
+
+    void Awake() { I = this; }
+
+    public void TryTriggerProximityFlashback(Vector3 playerPos, Vector3 monsterPos)
+    {
+        float d = Vector3.Distance(playerPos, monsterPos);
+        if (d <= config.proximityTriggerDist)
+        {
+            TriggerSharedFlashback(FlashbackType.VisualGlitch);
+        }
+    }
+
+    public void TriggerSharedFlashback(FlashbackType type)
+    {
+        string id = type.ToString() + "_" + Random.Range(1000, 9999);
+        NetRunner.I.BroadcastFlashback(id);
+        ApplyFlashbackToAll(type);
+        MasterySystem.I.OnSurviveFlashback(); // progression hook
+    }
+
+    public void TriggerPersonalFlashback(NetPlayer player, FlashbackType type)
+    {
+        ApplyFlashbackToPlayer(player, type);
+        MasterySystem.I.OnSurviveFlashback();
+    }
+
+    void ApplyFlashbackToAll(FlashbackType type)
+    {
+        foreach (var p in NetRunner.I.ConnectedPlayers)
+            ApplyFlashbackToPlayer(p, type);
+    }
+
+    void ApplyFlashbackToPlayer(NetPlayer p, FlashbackType type)
+    {
+        switch (type)
+        {
+            case FlashbackType.VisualGlitch:
+                p.HUD.PlayOverlay("BloodWalls", Random.Range(0.5f, 2f));
+                p.Audio.PlayOneShot("MetalImpactDist");
+                break;
+            case FlashbackType.AudioMemory:
+                p.Audio.PlayOneShot("WhisperCountdown");
+                p.Audio.PlayOneShot("BreathingBehind");
+                p.Audio.PlayOneShot("RadioStatic");
+                break;
+            case FlashbackType.RareText:
+                p.HUD.TextFlicker("> We shouldn’t have taught it the lights.", 1.5f);
+                break;
+        }
+        // Player remains vulnerable; no pause
+    }
+}
+using UnityEngine;
+
+public class MasterySystem : MonoBehaviour
+{
+    public static MasterySystem I;
+    public int Level { get; private set; } = 0;
+    int fragmentsFoundThisRun = 0;
+    bool reachedDeepSection = false;
+    bool observedMonsterBehavior = false;
+
+    void Awake() { I = this; DontDestroyOnLoad(gameObject); }
+
+    public void InitializeSession()
+    {
+        fragmentsFoundThisRun = 0;
+        reachedDeepSection = false;
+        observedMonsterBehavior = false;
+    }
+
+    public void OnDiscoverFragment()
+    {
+        fragmentsFoundThisRun++;
+        EnvironmentalStoryManager.I.UpdateCluesForLevel(Level);
+    }
+
+    public void OnReachDeepSection() { reachedDeepSection = true; }
+    public void OnObserveMonster() { observedMonsterBehavior = true; }
+
+    public void OnSurviveFlashback()
+    {
+        // optional: tally resilience
+    }
+
+    public void CommitSessionProgress(bool escaped, bool truth, bool masteryEnding)
+    {
+        int delta = 0;
+        if (fragmentsFoundThisRun > 0) delta += 1;
+        if (reachedDeepSection) delta += 1;
+        if (observedMonsterBehavior) delta += 1;
+        if (truth) delta += 1;
+        if (masteryEnding) delta += 2;
+
+        Level = Mathf.Clamp(Level + delta, 0, CloudSaveManager.I.Config.masteryMaxLevel);
+        CloudSaveManager.I.SaveMastery(Level);
+    }
+}
+using UnityEngine;
+using System.Collections.Generic;
+
+public class CoinSpawner : MonoBehaviour
+{
+    public static CoinSpawner I;
+    public GameObject coinPrefab;
+    public GameConfig config;
+
+    List<Transform> validNodes = new();
+    HashSet<int> usedIndices = new();
+
+    void Awake() { I = this; }
+
+    public void RegisterNodes(List<Transform> nodes) => validNodes = nodes;
+
+    public void SpawnSessionCoins()
+    {
+        usedIndices.Clear();
+        int count = Random.Range(config.coinsMin, config.coinsMax);
+        for (int i = 0; i < count; i++)
+        {
+            int idx = GetRandomValidIndex();
+            var pos = validNodes[idx].position;
+            if (IsRisky(pos))
+            {
+                Instantiate(coinPrefab, pos, Quaternion.identity);
+            }
+            else if (Random.value < 0.35f) // some in safer zones
+            {
+                Instantiate(coinPrefab, pos, Quaternion.identity);
+            }
+        }
+    }
+
+    int GetRandomValidIndex()
+    {
+        int idx;
+        int attempts = 0;
+        do
+        {
+            idx = Random.Range(0, validNodes.Count);
+            attempts++;
+        }
+        while ((usedIndices.Contains(idx) || NearSpawnOrExit(validNodes[idx].position)) && attempts < 50);
+        usedIndices.Add(idx);
+        return idx;
+    }
+
+    bool NearSpawnOrExit(Vector3 p)
+    {
+        return SpawnPoints.I.NearSpawn(p) || SpawnPoints.I.NearExit(p);
+    }
+
+    bool IsRisky(Vector3 p)
+    {
+        // Dark corners, dead ends, monster patrol nodes
+        float cornerDepth = HallwayGraph.I.CornerDepth(p);
+        bool deadEnd = HallwayGraph.I.IsDeadEnd(p);
+        bool patrol = HallwayGraph.I.IsMonsterPatrolNode(p);
+        float score = 0f;
+        if (cornerDepth > 0.7f) score += 0.6f;
+        if (deadEnd) score += 0.6f;
+        if (patrol) score += 0.5f;
+        return score * config.riskyWeight > 0.8f;
+    }
+}
+using UnityEngine;
+using System.Collections.Generic;
+
+[System.Serializable]
+public class CosmeticItem
+{
+    public string id;
+    public string displayName;
+    public string category; // Outfit, Gloves, Shoes, Flashlight, Emblem
+    public int price;
+    public string prefabRef;
+}
+
+public class InventorySystem : MonoBehaviour
+{
+    public static InventorySystem I;
+    public List<CosmeticItem> Catalog = new();
+    HashSet<string> owned = new();
+
+    void Awake() { I = this; DontDestroyOnLoad(gameObject); }
+
+    public bool Owns(string id) => owned.Contains(id);
+    public bool Purchase(string id)
+    {
+        var item = Catalog.Find(c => c.id == id);
+        if (item == null) return false;
+        if (CloudSaveManager.I.Coins < item.price) return false;
+        CloudSaveManager.I.AddCoins(-item.price);
+        owned.Add(id);
+        CloudSaveManager.I.SaveOwnedCosmetic(id);
+        return true;
+    }
+}
+using UnityEngine;
+
+public class UserNameSystem : MonoBehaviour
+{
+    public static UserNameSystem I;
+    public string ScreenName { get; private set; }
+    bool firstChangeUsed;
+
+    void Awake()
+    {
+        I = this; DontDestroyOnLoad(gameObject);
+        ScreenName = CloudSaveManager.I.LoadScreenNameOrDefault();
+        firstChangeUsed = CloudSaveManager.I.LoadFirstNameChangeUsed();
+    }
+
+    public bool TryChangeName(string newName)
+    {
+        if (!firstChangeUsed)
+        {
+            firstChangeUsed = true;
+            CloudSaveManager.I.SaveFirstNameChangeUsed();
+        }
+        else
+        {
+            const int cost = 1000;
+            if (CloudSaveManager.I.Coins < cost) return false;
+            CloudSaveManager.I.AddCoins(-cost);
+        }
+        ScreenName = newName;
+        CloudSaveManager.I.SaveScreenName(newName);
+        return true;
+    }
+}
+using UnityEngine;
+using System.Collections.Generic;
+
+public class CloudSaveManager : MonoBehaviour
+{
+    public static CloudSaveManager I;
+    public GameConfig Config;
+    public int Coins { get; private set; } = 0;
+    public int MasteryLevel { get; private set; } = 0;
+    HashSet<string> ownedCosmetics = new();
+
+    void Awake() { I = this; DontDestroyOnLoad(gameObject); }
+
+    public void Initialize()
+    {
+        // TODO: Authenticate (Email/Password, Guest, Apple, Google)
+        // TODO: Pull cloud data into local cache
+    }
+
+    public void SaveMastery(int level) { MasteryLevel = level; /* push to cloud */ }
+    public void AddCoins(int delta) { Coins = Mathf.Max(0, Coins + delta); /* push */ }
+    public void SaveOwnedCosmetic(string id) { ownedCosmetics.Add(id); /* push */ }
+
+    public string LoadScreenNameOrDefault() => "Volunteer_" + Random.Range(1000, 9999);
+    public void SaveScreenName(string s) { /* push */ }
+    public bool LoadFirstNameChangeUsed() => false;
+    public void SaveFirstNameChangeUsed() { /* push */ }
+
+    public void Flush()
+    {
+        // Push any pending saves
+    }
+}
+using UnityEngine;
+
+public class HallwayGraph : MonoBehaviour
+{
+    public static HallwayGraph I;
+
+    [SerializeField] Transform[] corners;
+    [SerializeField] Transform[] deadEnds;
+    [SerializeField] Transform[] patrolNodes;
+
+    void Awake() { I = this; }
+
+    public Vector3 GetRandomShadowCorner()
+    {
+        return corners[Random.Range(0, corners.Length)].position;
+    }
+
+    public float CornerDepth(Vector3 p)
+    {
+        // Heuristic: nearest corner distance normalized
+        float min = float.MaxValue;
+        foreach (var c in corners)
+            min = Mathf.Min(min, Vector3.Distance(p, c.position));
+        return Mathf.Clamp01(1f / Mathf.Max(min, 0.1f));
+    }
+
+    public bool IsDeadEnd(Vector3 p)
+    {
+        foreach (var d in deadEnds)
+            if (Vector3.Distance(p, d.position) < 1.5f) return true;
+        return false;
+    }
+
+    public bool IsMonsterPatrolNode(Vector3 p)
+    {
+        foreach (var n in patrolNodes)
+            if (Vector3.Distance(p, n.position) < 2f) return true;
+        return false;
+    }
+}
+using UnityEngine;
+
+public class SpawnPoints : MonoBehaviour
+{
+    public static SpawnPoints I;
+    public Transform[] playerSpawns;
+    public Transform[] exits;
+
+    void Awake() { I = this; }
+
+    public Vector3 GetPlayerSpawn(int index)
+    {
+        return playerSpawns[index % playerSpawns.Length].position;
+    }
+
+    public bool NearSpawn(Vector3 p)
+    {
+        foreach (var s in playerSpawns)
+            if (Vector3.Distance(p, s.position) < 6f) return true;
+        return false;
+    }
+
+    public bool NearExit(Vector3 p)
+    {
+        foreach (var e in exits)
+            if (Vector3.Distance(p, e.position) < 6f) return true;
+        return false;
+    }
+}
+using UnityEngine;
+
+public class CutsceneController : MonoBehaviour
+{
+    public AudioSource audioSrc;
+    public AudioClip emergencyHum, metalImpact;
+    public CanvasGroup black;
+    public TMPro.TextMeshProUGUI caption;
+
+    void Start()
+    {
+        StartCoroutine(Run());
+    }
+
+    System.Collections.IEnumerator Run()
+    {
+        black.alpha = 1f;
+        yield return new WaitForSeconds(0.5f);
+        audioSrc.PlayOneShot(emergencyHum);
+        // Fade in hallway, flickers
+        for (int i = 0; i < 12; i++)
+        {
+            LightingSystem.I.FlickerNearMonster(MonsterAI.I.transform.position, 6f, 1.0f, 0.3f);
+            yield return new WaitForSeconds(0.2f);
+        }
+        audioSrc.PlayOneShot(metalImpact);
+        caption.text = "The halls remember.";
+        yield return new WaitForSeconds(1.2f);
+        caption.text = "";
+        black.alpha = 0f;
+        GameFlow.I.BeginMatch();
+    }
+}
+using UnityEngine;
+
+public class EnvironmentalStoryManager : MonoBehaviour
+{
+    public static EnvironmentalStoryManager I;
+
+    [SerializeField] GameObject[] bloodDecals;
+    [SerializeField] GameObject[] researchNotes;
+
+    void Awake() { I = this; }
+
+    public void Init()
+    {
+        // Spawn decals and notes
+    }
+
+    public void UpdateCluesForLevel(int level)
+    {
+        // Level 1: subtle clues; Level 2: hidden hallways unlocked; Level 3: monster patterns hinted; Level 4: secret ending paths
+    }
+
+    public void EmitFalseSignal()
+    {
+        // At high mastery, monster mimics environmental sounds or flickers
+    }
+}
+using UnityEngine;
+
+public class HUDController : MonoBehaviour
+{
+    public CanvasGroup overlay;
+    public TMPro.TextMeshProUGUI flickerText;
+
+    public void PlayOverlay(string id, float seconds)
+    {
+        overlay.alpha = 1f;
+        Invoke(nameof(HideOverlay), seconds);
+    }
+
+    void HideOverlay() { overlay.alpha = 0f; }
+
+    public void TextFlicker(string text, float seconds)
+    {
+        flickerText.text = text;
+        Invoke(nameof(ClearText), seconds);
+    }
+
+    void ClearText() { flickerText.text = ""; }
+}
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+public class MainMenuController : MonoBehaviour
+{
+    public void OnJoinGame()
+    {
+        GameFlow.I.GoToLobby();
+    }
+
+    public void OnJoinFriends()
+    {
+        // Show invite code / friend list UI, then lobby
+        GameFlow.I.GoToLobby();
+    }
+
+    public void OnCustomize()
+    {
+        SceneManager.LoadScene("MainMenu"); // open panel
+        ShopUI.I?.OpenInventory();
+    }
+
+    public void OnSettings() { /* open settings panel */ }
+    public void OnAccount() { /* auth/account screen */ }
+}
+using UnityEngine;
+
+public class LobbyUI : MonoBehaviour
+{
+    public static LobbyUI I;
+    public TMPro.TextMeshProUGUI status;
+
+    void Awake() { I = this; }
+
+    public void UpdatePlayerCount(int count, int min, int max)
+    {
+        status.text = $"Players: {count}/{max} — Waiting for {Mathf.Max(0, min - count)} more";
+    }
+}
+using UnityEngine;
+
+public class ShopUI : MonoBehaviour
+{
+    public static ShopUI I;
+    public TMPro.TextMeshProUGUI coinText;
+    public Transform grid;
+    public GameObject itemEntryPrefab;
+    public GameObject previewModel;
+
+    void Awake() { I = this; }
+
+    public void OpenInventory()
+    {
+        Refresh();
+        // Show panel
+    }
+
+    public void Refresh()
+    {
+        coinText.text = CloudSaveManager.I.Coins.ToString();
+        // Populate grid from InventorySystem.I.Catalog
+    }
+
+    public void TryBuy(string itemId)
+    {
+        if (InventorySystem.I.Purchase(itemId))
+        {
+            Refresh();
+            // Update preview
+        }
+    }
+}
+using UnityEngine;
+
+public class NetPlayer : MonoBehaviour
+{
+    public PlayerRole Role { get; private set; } = PlayerRole.Survivor;
+    public HUDController HUD;
+    public AudioSource Audio;
+    public float CurrentVoiceLevel; // updated by voice input
+    public bool IsRunning;
+
+    public void SetRole(PlayerRole role)
+    {
+        Role = role;
+        ApplyRoleAbilities();
+    }
+
+    void ApplyRoleAbilities()
+    {
+        switch (Role)
+        {
+            case PlayerRole.Medic:
+                // Faster revive logic
+                break;
+            case PlayerRole.Detective:
+                // Reveal hidden symbols (shader toggle / decal layer)
+                break;
+            case PlayerRole.Watcher:
+                // Rare vague alerts (HUD pings)
+                InvokeRepeating(nameof(WatcherPing), Random.Range(10f, 20f), Random.Range(18f, 30f));
+                break;
+            case PlayerRole.Survivor:
+                // No special abilities
+                break;
+        }
+    }
+
+    void WatcherPing()
+    {
+        if (Random.value < 0.35f)
+        {
+            HUD.TextFlicker("Warning… something nearby.", 1.4f);
+        }
+    }
+}
+using UnityEngine;
+
+public class PingWheelController : MonoBehaviour
+{
+    public void Ping(string message)
+    {
+        // Send lightweight network message
+        // Display on teammates' HUDs
+    }
+}
+// Example usage:
+public class ObjectiveController : MonoBehaviour
+{
+    public void OnEscapeAchieved()
+    {
+        GameFlow.I.EndMatch(escaped: true, truth: false, masteryEnding: false);
+    }
+
+    public void OnTruthFilesFound()
+    {
+        GameFlow.I.EndMatch(escaped: false, truth: true, masteryEnding: false);
+    }
+
+    public void OnSecretEndingTriggered()
+    {
+        if (MasterySystem.I.Level >= 4)
+            GameFlow.I.EndMatch(escaped: false, truth: false, masteryEnding: true);
+    }
+}
